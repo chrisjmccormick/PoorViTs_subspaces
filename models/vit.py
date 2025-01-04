@@ -17,13 +17,16 @@ https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision
 """
 import math
 from functools import partial
+from typing import Optional
 
+import gin
 import torch
 import torch.nn as nn
 
 from utils.utils_ssl import trunc_normal_
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
+import torch.nn.functional as F
 
 def drop_path(x, drop_prob: float = 0., training: bool = False):
     if drop_prob == 0. or not training:
@@ -47,6 +50,7 @@ class DropPath(nn.Module):
         return drop_path(x, self.drop_prob, self.training)
 
 
+
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
@@ -65,20 +69,48 @@ class Mlp(nn.Module):
         x = self.drop(x)
         return x
 
+class FFN(nn.Module):
 
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.,num_groups=32):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features        
+        self.k = nn.Parameter(torch.randn(in_features//num_groups, num_groups, hidden_features,requires_grad=True))
+        self.v = nn.Parameter(torch.randn(in_features//num_groups, num_groups, hidden_features,requires_grad=True))
+        self.act = act_layer()
+        self.num_groups = num_groups
+        
+        self.proj = nn.Linear(in_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        q = (x).reshape(B,N, self.num_groups, C // self.num_groups)
+        k = (self.k)
+        
+        score = self.act(torch.einsum('b n g d, d g l -> b n g l',q, k)) # B N g l
+        # normalize the scores
+        attn = F.softmax(score, dim=-1)
+        # attn = attn / attn.sum(dim=-1, keepdim=True)  best so far
+        x = torch.einsum('b n g l, c g s -> b n (g c)', attn, self.v)
+        x = self.proj(x)
+        x = self.drop(x)
+        return x
+
+@gin.configurable
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.,latent_mode='',latent_dim=64):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = qk_scale or head_dim ** -0.5
         all_head_dim = head_dim * self.num_heads
+        self.latent_mode = latent_mode
+        
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(all_head_dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-#        self.to_conv3d = nn.Sequential(nn.Conv3d(dim,all_head_dim, 3,padding='same'), 
-#                                    nn.BatchNorm3d(all_head_dim))
 
     def forward(self, x):
         B, N, C = x.shape
@@ -91,30 +123,47 @@ class Attention(nn.Module):
         attn = self.attn_drop(attn)
 
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+
+        x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
-        return x, attn
+        return x
 
+class LayerScale(nn.Module):
+    def __init__(
+            self,
+            dim: int,
+            init_values: float = 1e-5,
+            inplace: bool = False,
+    ) -> None:
+        super().__init__()
+        self.inplace = inplace
+        self.gamma = nn.Parameter(init_values * torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.mul_(self.gamma) if self.inplace else x * self.gamma
+    
 
 class Block(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, init_values=None):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(
             dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+        self.ls1 = LayerScale(dim, init_values=init_values) if init_values is not None else nn.Identity()
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        self.ls2 = LayerScale(dim, init_values=init_values) if init_values is not None else nn.Identity()
 
     def forward(self, x, return_attention=False):
-        y, attn = self.attn(self.norm1(x))
-        if return_attention:
-            return attn
-        x = x + self.drop_path(y)
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        
+        x = x + self.drop_path(self.ls1(self.attn(self.norm1(x))))
+        x = x + self.drop_path(self.ls2(self.mlp(self.norm2(x))))
         return x
+
 
 
 class PatchEmbed(nn.Module):
@@ -134,12 +183,11 @@ class PatchEmbed(nn.Module):
         x = self.proj(x).flatten(2).transpose(1, 2)
         return x
 
-
 class VisionTransformer(nn.Module):
     """ Vision Transformer """
     def __init__(self, img_size=[224], patch_size=16, in_chans=3, num_classes=0, embed_dim=384, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0., norm_layer=nn.LayerNorm, **kwargs):
+                 drop_path_rate=0., norm_layer=nn.LayerNorm, sin_pos=False, **kwargs):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
         self.patch_size = patch_size
@@ -154,15 +202,18 @@ class VisionTransformer(nn.Module):
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         self.blocks = nn.ModuleList([
-            Block(
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+            Block( 
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, 
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
 
         # Classifier head
         self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
-        trunc_normal_(self.pos_embed, std=.02)
+        if sin_pos:
+            self.build_2d_sincos_position_embedding()
+        else:
+            trunc_normal_(self.pos_embed, std=.02)
         trunc_normal_(self.cls_token, std=.02)
         self.apply(self._init_weights)
 
@@ -199,8 +250,27 @@ class VisionTransformer(nn.Module):
 
 
 
+    def build_2d_sincos_position_embedding(self, temperature=10000.):
+        h, w = 8,8
+        grid_w = torch.arange(w, dtype=torch.float32)
+        grid_h = torch.arange(h, dtype=torch.float32)
+        grid_w, grid_h = torch.meshgrid(grid_w, grid_h)
+        assert self.embed_dim % 4 == 0, 'Embed dimension must be divisible by 4 for 2D sin-cos position embedding'
+        pos_dim = self.embed_dim // 4
+        omega = torch.arange(pos_dim, dtype=torch.float32) / pos_dim
+        omega = 1. / (temperature**omega)
+        out_w = torch.einsum('m,d->md', [grid_w.flatten(), omega])
+        out_h = torch.einsum('m,d->md', [grid_h.flatten(), omega])
+        pos_emb = torch.cat([torch.sin(out_w), torch.cos(out_w), torch.sin(out_h), torch.cos(out_h)], dim=1)[None, :, :]
 
-    def prepare_tokens(self, x):
+        assert self.num_tokens == 1, 'Assuming one and only one token, [cls]'
+        pe_token = torch.zeros([1, 1, self.embed_dim], dtype=torch.float32)
+        self.pos_embed = nn.Parameter(torch.cat([pe_token, pos_emb], dim=1))
+        self.pos_embed.requires_grad = False
+
+
+
+    def prepare_tokens(self, x, return_x0=False):
         B, nc, w, h = x.shape
         x = self.patch_embed(x)  # patch linear embedding
         B, L, _  = x.shape
@@ -212,15 +282,19 @@ class VisionTransformer(nn.Module):
 
         # add the [CLS] token to the embed patch tokens
         cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
+        x0 = torch.cat((cls_tokens, x), dim=1)
         # add positional encoding to each token
-        x = x + self.interpolate_pos_encoding(x, w, h)
-
-        return self.pos_drop(x)
+        x = x0 + self.interpolate_pos_encoding(x0, w, h)
+        if return_x0:
+            return x0, self.pos_drop(x)
+        else:
+            return self.pos_drop(x)
 
     def forward(self, x):
-        x = self.prepare_tokens(x)
-        for blk in self.blocks:
+        x0, x = self.prepare_tokens(x, True)
+        for i,blk in enumerate(self.blocks):
+            # if i in [3,6,9]:
+            #     x = x + x0
             x = blk(x)
         x = self.norm(x)
         return self.head(x[:,0])
