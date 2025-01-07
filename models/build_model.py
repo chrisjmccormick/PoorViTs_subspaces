@@ -6,7 +6,7 @@ from functools import partial
 from torch import nn
 
 import gin
-
+import torch
 
 
 def create_model(img_size, n_classes, args):
@@ -17,9 +17,9 @@ def create_model(img_size, n_classes, args):
             patch_size=args.patch_size,
             in_chans=3,
             num_classes=n_classes,
-            embed_dim=192,
-            depth=9,
-            num_heads=12,
+            # embed_dim=192,
+            # depth=9,
+            # num_heads=12,
             mlp_ratio=args.vit_mlp_ratio,
             qkv_bias=True,
             drop_path_rate=args.sd,
@@ -57,7 +57,15 @@ def create_model(img_size, n_classes, args):
         model = SwinTransformer(img_size=img_size,
         window_size=window_size, patch_size=patch_size, embed_dim=96, depths=[2, 6, 4], num_heads=[3, 6, 12],num_classes=n_classes,
        	mlp_ratio=mlp_ratio, qkv_bias=True, drop_path_rate=args.sd)
-
+    elif args.arch == 'none':
+        class NoneModel(nn.Module):
+            def __init__(self):
+                super(NoneModel, self).__init__()
+                self.model = nn.Parameter(torch.randn(1, 10,requires_grad=True))
+            def forward(self, x):
+                
+                return self.model.repeat(x.shape[0],1)
+        model = NoneModel()
     else:
         NotImplementedError("Model architecture not implemented . . .")
 

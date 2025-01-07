@@ -25,10 +25,11 @@ from utils.dataloader import datainfo, dataload
 from models.build_model import create_model
 from tqdm import tqdm
 import warnings
+import gin
 warnings.filterwarnings("ignore", category=Warning)
 
 best_acc1 = 0
-MODELS = ['vit', 'swin', 'cait']
+MODELS = ['vit', 'swin', 'cait', 'none']
 
 #############################################
 #       Whitening Conv Initialization       #
@@ -59,8 +60,10 @@ def init_parser():
     parser = argparse.ArgumentParser(
         description='Vit small datasets quick training script')
 
+    parser.add_argument('--profile', action='store_true', default=False, help='profile training')
     parser.add_argument('--whitening', action='store_true',default=False, help='Use whitening initialization')
     parser.add_argument('--sin_pos', action='store_true',default=False, help='Use sin position embedding')
+    parser.add_argument('--gin', nargs='+', type=str, default=[], help='Configure Modules')
     # Data args
     parser.add_argument('--datapath', default='./data',
                         type=str, help='dataset path')
@@ -409,6 +412,10 @@ def main(args):
         pbar = tqdm(range(args.epochs))
     else:
         pbar = range(args.epochs)
+    
+    if args.profile:
+        train_profile(train_loader, model, criterion, optimizer, args.epochs, scheduler, loss_scaler, args)
+        return
     for epoch in pbar:
         if args.distributed:
             train_loader.sampler.set_epoch(epoch)
@@ -542,9 +549,61 @@ def train(train_loader, model, criterion, optimizer, epoch, scheduler,  loss_sca
 
     logger_dict.update(keys[0], avg_loss)
     logger_dict.update(keys[1], avg_acc1)
-
+    if wandb.run:
+            wandb.log({"train/loss": avg_loss, "train/acc": avg_acc1, 'epoch': epoch})
     return lr
 
+import torch.profiler
+
+def train_profile(train_loader, model, criterion, optimizer, epoch, scheduler, loss_scaler, args):
+    model.train()
+    loss_val, acc1_val = 0, 0
+    n = 0
+
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(
+            wait=1,
+            warmup=1,
+            active=3,
+            repeat=2),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler('./log'),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    ) as prof:
+        for i, (images, target) in enumerate(train_loader):
+            with torch.profiler.record_function("load_batch"):
+                if (not args.no_cuda) and torch.cuda.is_available():
+                    images = images.cuda(args.gpu, non_blocking=True)
+                    target = target.cuda(args.gpu, non_blocking=True)
+
+            # Cutmix only
+            
+            with torch.profiler.record_function("forward"):
+                r = np.random.rand(1)
+                with torch.cuda.amp.autocast(enabled=args.amp):
+                    if r < args.mix_prob:
+                        slicing_idx, y_a, y_b, lam, sliced = cutmix_data(
+                            images, target, args)
+                        images[:, :, slicing_idx[0]:slicing_idx[2],
+                            slicing_idx[1]:slicing_idx[3]] = sliced
+                        output = model(images)
+                        loss = mixup_criterion(criterion, output, y_a, y_b, lam)
+                    else:
+                        output = model(images)
+                        loss = criterion(output, target)
+            with torch.profiler.record_function("backward"):
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+            # Update the profiler
+            prof.step()
+            if i > 10:
+                break
+        
 
 def validate(val_loader, model, criterion, lr, args, epoch=None):
     model.eval()
@@ -585,6 +644,7 @@ def validate(val_loader, model, criterion, lr, args, epoch=None):
 if __name__ == '__main__':
     parser = init_parser()
     args = parser.parse_args()
+    gin.parse_config(args.gin)
     global save_path
     global writer
 
