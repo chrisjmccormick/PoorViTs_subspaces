@@ -226,6 +226,7 @@ class Block(nn.Module):
                  norm_layer=nn.LayerNorm, init_values=None, attn_layer=Attention,
                  mlp_block=Mlp, q_proj_dim=None, kv_proj_dim=None,
                  output_subspace=False, o_proj_dim=None, o_bias=True):
+
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = attn_layer(
@@ -276,6 +277,7 @@ class VisionTransformer(nn.Module):
                  q_proj_dim=None, kv_proj_dim=None,
                  output_subspace=False, o_proj_dim=None, o_bias=True,
                  **kwargs):
+
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
         self.patch_size = patch_size
@@ -297,15 +299,19 @@ class VisionTransformer(nn.Module):
                 mlp_block=mlp_block,
                 q_proj_dim=q_proj_dim, kv_proj_dim=kv_proj_dim,
                 output_subspace=output_subspace, o_proj_dim=o_proj_dim, o_bias=o_bias)
+
             for i in range(depth)])
         self.depth_token_only = depth_token_only
         self.blocks_token_only = nn.ModuleList([
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
+
                 attn_layer=partial(ClassAttn, num_cls_token=num_cls_token), mlp_block=mlp_block,
                 q_proj_dim=q_proj_dim, kv_proj_dim=kv_proj_dim,
                 output_subspace=output_subspace, o_proj_dim=o_proj_dim, o_bias=o_bias)
+                attn_layer=partial(ClassAttn, num_cls_token=num_cls_token), mlp_block=mlp_block)
+
             for i in range(depth_token_only)])
         
         self.norm = norm_layer(embed_dim)
