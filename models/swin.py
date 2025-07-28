@@ -22,24 +22,7 @@ from math import sqrt
 from functools import partial
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from timm.models.registry import register_model
-
-class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
-        super(Mlp, self).__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
-        self.drop = nn.Dropout(drop)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
+from .mlp import Mlp, MlpDecomp
 
 
 def window_partition(x, window_size):
@@ -196,7 +179,7 @@ class SwinTransformerBlock(nn.Module):
 
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, mlp_block=Mlp):
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
@@ -218,7 +201,7 @@ class SwinTransformerBlock(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        self.mlp = mlp_block(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
         self.H = input_resolution[0]
         self.W = input_resolution[1]
@@ -405,7 +388,7 @@ class BasicLayer(nn.Module):
 
     def __init__(self, dim, input_resolution, depth, num_heads, window_size,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., norm_layer=nn.LayerNorm, downsample=None):
+                 drop_path=0., norm_layer=nn.LayerNorm, downsample=None, mlp_block=Mlp):
 
         super().__init__()
         self.dim = dim
@@ -420,7 +403,7 @@ class BasicLayer(nn.Module):
                                  qkv_bias=qkv_bias, qk_scale=qk_scale,
                                  drop=drop, attn_drop=attn_drop,
                                  drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                                 norm_layer=norm_layer)
+                                 norm_layer=norm_layer, mlp_block=mlp_block)
             for i in range(depth)])
         if downsample is not None:
             self.downsample = downsample(input_resolution, dim=dim, norm_layer=norm_layer)
@@ -539,8 +522,9 @@ class SwinTransformer(nn.Module):
                  embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24],
                  window_size=7, mlp_ratio=4., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
-                 norm_layer=partial(nn.LayerNorm, eps=1e-6), ape=False, patch_norm=True, 
-                 return_all_tokens=False, use_mean_pooling=True, masked_im_modeling=False):
+                 norm_layer=partial(nn.LayerNorm, eps=1e-6), ape=False, patch_norm=True,
+                 return_all_tokens=False, use_mean_pooling=True, masked_im_modeling=False,
+                 mlp_block=Mlp):
 
         super().__init__()
 
@@ -581,7 +565,8 @@ class SwinTransformer(nn.Module):
                                drop=drop_rate, attn_drop=attn_drop_rate,
                                drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
                                norm_layer=norm_layer,
-                               downsample=PatchMerging if (i_layer < self.num_layers - 1) else None)
+                               downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
+                               mlp_block=mlp_block)
             self.layers.append(layer)
 
         self.norm = norm_layer(self.num_features)

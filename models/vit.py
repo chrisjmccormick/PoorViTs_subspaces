@@ -22,6 +22,7 @@ from typing import Optional
 import gin
 import torch
 import torch.nn as nn
+from .mlp import Mlp, MlpDecomp
 
 from utils.utils_ssl import trunc_normal_
 from einops import rearrange, repeat
@@ -54,23 +55,6 @@ class DropPath(nn.Module):
 
 
 
-class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
-        self.drop = nn.Dropout(drop)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
 
 class FFN(nn.Module):
 
@@ -102,35 +86,39 @@ class FFN(nn.Module):
 
 @gin.configurable
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.,latent_mode='',latent_dim=64):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None,
+                 attn_drop=0., proj_drop=0.,
+                 q_proj_dim=None, kv_proj_dim=None,
+                 output_subspace=False, o_proj_dim=None, o_bias=True):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = qk_scale or head_dim ** -0.5
         all_head_dim = head_dim * self.num_heads
-        self.latent_mode = latent_mode
-        self.latent_dim = latent_dim
 
-        if 'q' in self.latent_mode:
-            self.q = nn.Linear(dim, self.latent_dim, bias=False)
-            self.W_q = nn.Linear(self.latent_dim, dim, bias=qkv_bias)
-        else:
-            self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        q_proj_dim = q_proj_dim or dim
+        kv_proj_dim = kv_proj_dim or dim
 
-        if 'k' in self.latent_mode:
-            self.k = nn.Linear(dim, self.latent_dim, bias=False)
-            self.W_k = nn.Linear(self.latent_dim, dim, bias=qkv_bias)
-        else:
-            self.k = nn.Linear(dim, dim, bias=qkv_bias)
+        # Shared query and key-value latent projections
+        self.q_proj = nn.Linear(dim, q_proj_dim, bias=qkv_bias)
+        self.kv_proj = nn.Linear(dim, kv_proj_dim, bias=qkv_bias)
 
-        if 'v' in self.latent_mode:
-            self.v = nn.Linear(dim, self.latent_dim, bias=False)
-            self.W_v = nn.Linear(self.latent_dim, dim, bias=qkv_bias)
-        else:
-            self.v = nn.Linear(dim, dim, bias=qkv_bias)
+        # Per-head projections from latent spaces
+        self.q = nn.Linear(q_proj_dim, all_head_dim, bias=qkv_bias)
+        self.kv = nn.Linear(kv_proj_dim, 2 * all_head_dim, bias=qkv_bias)
 
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(all_head_dim, dim)
+
+        self.output_subspace = output_subspace
+        if self.output_subspace:
+            if o_proj_dim is None:
+                o_proj_dim = dim
+            self.proj = nn.Linear(all_head_dim, o_proj_dim, bias=o_bias)
+            self.o_proj = nn.Linear(o_proj_dim, dim, bias=False)
+        else:
+            self.proj = nn.Linear(all_head_dim, dim, bias=o_bias)
+            self.o_proj = None
+
         self.proj_drop = nn.Dropout(proj_drop)
 
         
@@ -138,26 +126,15 @@ class Attention(nn.Module):
     def forward(self, x):
         B, N, C = x.shape
         
-        if 'q' in self.latent_mode:
-            q = self.q(x)
-            q = self.W_q(q)
-        else:
-            q = self.q(x)
-        q = q.reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
-        
-        if 'k' in self.latent_mode:
-            k = self.k(x)
-            k = self.W_k(k)
-        else:
-            k = self.k(x)
-        k = k.reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        q_latent = self.q_proj(x)
+        kv_latent = self.kv_proj(x)
 
-        if 'v' in self.latent_mode:
-            v = self.v(x)
-            v = self.W_v(v)
-        else:
-            v = self.v(x)
-        v = v.reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        q = self.q(q_latent)
+        q = q.reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+
+        kv = self.kv(kv_latent)
+        kv = kv.reshape(B, N, 2, self.num_heads, C // self.num_heads)
+        k, v = kv.unbind(2)
 
         if fused_attn:
             x = F.scaled_dot_product_attention(
@@ -173,8 +150,10 @@ class Attention(nn.Module):
             x = attn @ v    
 
         x = x.transpose(1, 2).reshape(B, N, C)
-        
+
         x = self.proj(x)
+        if self.o_proj is not None:
+            x = self.o_proj(x)
         x = self.proj_drop(x)
         return x
 
@@ -242,17 +221,23 @@ class ClassAttn(nn.Module):
         
 
 class Block(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, init_values=None, attn_layer = Attention):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None,
+                 drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU,
+                 norm_layer=nn.LayerNorm, init_values=None, attn_layer=Attention,
+                 mlp_block=Mlp, q_proj_dim=None, kv_proj_dim=None,
+                 output_subspace=False, o_proj_dim=None, o_bias=True):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = attn_layer(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
+            attn_drop=attn_drop, proj_drop=drop,
+            q_proj_dim=q_proj_dim, kv_proj_dim=kv_proj_dim,
+            output_subspace=output_subspace, o_proj_dim=o_proj_dim, o_bias=o_bias)
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values is not None else nn.Identity()
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        self.mlp = mlp_block(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values is not None else nn.Identity()
 
     def forward(self, x, return_attention=False):
@@ -283,11 +268,14 @@ class PatchEmbed(nn.Module):
 @gin.configurable('ViT')
 class VisionTransformer(nn.Module):
     """ Vision Transformer """
-    def __init__(self, img_size=[224], patch_size=16, in_chans=3, num_classes=0, 
-                embed_dim=192, depth=12, num_heads=12, mlp_ratio=2., 
+    def __init__(self, img_size=[224], patch_size=16, in_chans=3, num_classes=0,
+                 embed_dim=192, depth=12, num_heads=12, mlp_ratio=2.,
                  qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 num_cls_token = 1, depth_token_only=0,
-                 drop_path_rate=0., norm_layer=nn.LayerNorm, sin_pos=False, **kwargs):
+                 num_cls_token=1, depth_token_only=0,
+                 drop_path_rate=0., norm_layer=nn.LayerNorm, sin_pos=False, mlp_block=Mlp,
+                 q_proj_dim=None, kv_proj_dim=None,
+                 output_subspace=False, o_proj_dim=None, o_bias=True,
+                 **kwargs):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
         self.patch_size = patch_size
@@ -303,16 +291,21 @@ class VisionTransformer(nn.Module):
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         self.blocks = nn.ModuleList([
-            Block( 
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, 
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
+            Block(
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
+                mlp_block=mlp_block,
+                q_proj_dim=q_proj_dim, kv_proj_dim=kv_proj_dim,
+                output_subspace=output_subspace, o_proj_dim=o_proj_dim, o_bias=o_bias)
             for i in range(depth)])
         self.depth_token_only = depth_token_only
         self.blocks_token_only = nn.ModuleList([
-            Block( 
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, 
+            Block(
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
-                attn_layer=partial(ClassAttn, num_cls_token=num_cls_token))
+                attn_layer=partial(ClassAttn, num_cls_token=num_cls_token), mlp_block=mlp_block,
+                q_proj_dim=q_proj_dim, kv_proj_dim=kv_proj_dim,
+                output_subspace=output_subspace, o_proj_dim=o_proj_dim, o_bias=o_bias)
             for i in range(depth_token_only)])
         
         self.norm = norm_layer(embed_dim)
