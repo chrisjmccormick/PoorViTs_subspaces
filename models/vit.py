@@ -86,7 +86,8 @@ class FFN(nn.Module):
 
 @gin.configurable
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.,latent_mode='',latent_dim=64):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.,
+                 latent_mode='', latent_dim=64, output_subspace=False, o_proj_dim=None, o_bias=True):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
@@ -114,7 +115,17 @@ class Attention(nn.Module):
             self.v = nn.Linear(dim, dim, bias=qkv_bias)
 
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(all_head_dim, dim)
+
+        self.output_subspace = output_subspace
+        if self.output_subspace:
+            if o_proj_dim is None:
+                o_proj_dim = dim
+            self.proj = nn.Linear(all_head_dim, o_proj_dim, bias=o_bias)
+            self.o_proj = nn.Linear(o_proj_dim, dim, bias=False)
+        else:
+            self.proj = nn.Linear(all_head_dim, dim, bias=o_bias)
+            self.o_proj = None
+
         self.proj_drop = nn.Dropout(proj_drop)
 
         
@@ -157,8 +168,10 @@ class Attention(nn.Module):
             x = attn @ v    
 
         x = x.transpose(1, 2).reshape(B, N, C)
-        
+
         x = self.proj(x)
+        if self.o_proj is not None:
+            x = self.o_proj(x)
         x = self.proj_drop(x)
         return x
 
