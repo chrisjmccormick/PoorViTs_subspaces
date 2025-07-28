@@ -22,6 +22,7 @@ from typing import Optional
 import gin
 import torch
 import torch.nn as nn
+from .mlp import Mlp, MlpDecomp
 
 from utils.utils_ssl import trunc_normal_
 from einops import rearrange, repeat
@@ -54,23 +55,6 @@ class DropPath(nn.Module):
 
 
 
-class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
-        self.drop = nn.Dropout(drop)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
 
 class FFN(nn.Module):
 
@@ -243,7 +227,8 @@ class ClassAttn(nn.Module):
 
 class Block(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, init_values=None, attn_layer = Attention):
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, init_values=None,
+                 attn_layer=Attention, mlp_block=Mlp):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = attn_layer(
@@ -252,7 +237,7 @@ class Block(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        self.mlp = mlp_block(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values is not None else nn.Identity()
 
     def forward(self, x, return_attention=False):
@@ -286,8 +271,8 @@ class VisionTransformer(nn.Module):
     def __init__(self, img_size=[224], patch_size=16, in_chans=3, num_classes=0, 
                 embed_dim=192, depth=12, num_heads=12, mlp_ratio=2., 
                  qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 num_cls_token = 1, depth_token_only=0,
-                 drop_path_rate=0., norm_layer=nn.LayerNorm, sin_pos=False, **kwargs):
+                 num_cls_token=1, depth_token_only=0,
+                 drop_path_rate=0., norm_layer=nn.LayerNorm, sin_pos=False, mlp_block=Mlp, **kwargs):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
         self.patch_size = patch_size
@@ -303,16 +288,17 @@ class VisionTransformer(nn.Module):
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         self.blocks = nn.ModuleList([
-            Block( 
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, 
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
+            Block(
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
+                mlp_block=mlp_block)
             for i in range(depth)])
         self.depth_token_only = depth_token_only
         self.blocks_token_only = nn.ModuleList([
-            Block( 
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, 
+            Block(
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
-                attn_layer=partial(ClassAttn, num_cls_token=num_cls_token))
+                attn_layer=partial(ClassAttn, num_cls_token=num_cls_token), mlp_block=mlp_block)
             for i in range(depth_token_only)])
         
         self.norm = norm_layer(embed_dim)
